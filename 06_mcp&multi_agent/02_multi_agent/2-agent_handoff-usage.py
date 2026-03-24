@@ -1,22 +1,35 @@
+"""
+示例 8：使用 handoff 把用户问题交给专家 Agent。
+
+这个示例和前一个 `agent_as_tool` 最大的不同是：
+
+- `as_tool`：总控 Agent 始终掌握主导权，只把专家当工具调用
+- `handoff`：总控 Agent 会把控制权真正移交给专家 Agent
+
+因此 handoff 更像：
+“前台把客户转接给专业部门，由专业部门继续主导对话。”
+"""
+
 import asyncio
+
 from openai import AsyncOpenAI
+from openai.types.responses import ResponseTextDeltaEvent
 
 from agents import (
     Agent,
+    ModelSettings,
     OpenAIChatCompletionsModel,
     Runner,
     function_tool,
     set_tracing_disabled,
-    ModelSettings,
 )
-
-from openai.types.responses import ResponseTextDeltaEvent
 
 
 # ====== OpenAI-compatible 配置（以 DashScope/Qwen 示例）======
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 API_KEY = "sk-26d57c968c364e7bb14f1fc350d4bff0"
 MODEL_NAME = "qwen3-max"
+
 
 client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
 set_tracing_disabled(True)
@@ -25,10 +38,19 @@ set_tracing_disabled(True)
 # ====== 1) 底层真实工具（演示：写死）======
 @function_tool
 def get_weather(city: str) -> str:
+    """
+    查询天气。
+    """
+
     return f"{city}：晴，24℃，风力2级"
+
 
 @function_tool
 def get_air_quality(city: str) -> str:
+    """
+    查询空气质量。
+    """
+
     return f"{city}：AQI 55（良），PM2.5 18"
 
 
@@ -44,9 +66,11 @@ weather_agent = Agent(
     ),
     model=OpenAIChatCompletionsModel(model=MODEL_NAME, openai_client=client),
     tools=[get_weather],
-    # 这里不强制 required，因为“没城市要先追问”，强制会导致无意义调用
+    # 这里用 `auto` 而不是 `required`，
+    # 因为当用户没提供城市时，专家应该先追问，而不是强行调用工具。
     model_settings=ModelSettings(tool_choice="auto"),
 )
+
 
 aqi_agent = Agent(
     name="AQI agent",
@@ -81,23 +105,25 @@ triage_agent = Agent(
 
 
 async def main():
-    # 你可以改成：
-    # "武汉天气怎么样？"
-    # "武汉空气质量如何？"
-    # "天气如何？"（无城市 -> 追问）
+    """
+    演示分诊 Agent 如何把控制权交给专家 Agent。
+    """
+
     user_question = "武汉天气怎么样？顺便空气质量呢？"
-    # user_question = "武汉天气怎么样？"
 
     result = Runner.run_streamed(triage_agent, user_question)
 
     print("\n=== STREAM EVENTS ===")
 
     async for event in result.stream_events():
-        # A) agent 更新事件：handoff 时最关键（你能看到接管者是谁）
+        # A) agent 更新事件
+        #
+        # 这是 handoff 场景里最有代表性的信号。
+        # 一旦发生交接，你会看到当前活跃 Agent 变成另一个专家 Agent。
         if event.type == "agent_updated_stream_event":
             print("\n👤 agent_updated_stream_event ->", event.new_agent.name)
 
-        # B) run_item_stream_event：工具调用 / 工具结果 / 消息创建
+        # B) 执行节点事件
         if event.type == "run_item_stream_event":
             name = getattr(event, "name", None)
 
@@ -113,7 +139,8 @@ async def main():
                 msg = event.item.raw_item
                 print(f"\n🧾 message_output_created: role={getattr(msg, 'role', None)}")
 
-        # C) 文本增量：最终“输出内容”会从接管后的 agent 流出来
+        # C) 文本增量
+        # handoff 之后，最终输出内容会由“接管后的专家 Agent”流出来。
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             print(event.data.delta, end="", flush=True)
 

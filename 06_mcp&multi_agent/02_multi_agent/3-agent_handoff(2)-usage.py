@@ -1,32 +1,62 @@
+"""
+示例 9：双向 handoff，让多个需求被顺序处理。
+
+这个例子是在前一个 handoff 示例基础上的升级版。
+
+前一个版本的设计更像：
+- 分诊 Agent 把用户转给某个专家
+- 专家处理完当前问题后，对话基本结束，或者需要用户重新提问
+
+这个版本更进一步：
+- 专家处理完自己的部分后，可以把控制权再交回给分诊 Agent
+- 分诊 Agent 再决定是否需要继续转给下一个专家
+
+这就形成了一种“可回流的多 Agent 协作链”。
+"""
+
 import asyncio
+
 from openai import AsyncOpenAI
+from openai.types.responses import ResponseTextDeltaEvent
+
 from agents import (
     Agent,
+    ModelSettings,
     OpenAIChatCompletionsModel,
     Runner,
     function_tool,
     set_tracing_disabled,
-    ModelSettings,
 )
 
-from openai.types.responses import ResponseTextDeltaEvent
 
 # ====== OpenAI-compatible 配置（以 DashScope/Qwen 示例）======
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 API_KEY = "sk-26d57c968c364e7bb14f1fc350d4bff0"
 MODEL_NAME = "qwen3-max"
 
+
 client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
 set_tracing_disabled(True)
+
 
 # ====== 1) 底层工具（天气与空气质量）======
 @function_tool
 def get_weather(city: str) -> str:
+    """
+    查询天气。
+    """
+
     return f"{city}：晴，24℃，风力2级"
+
 
 @function_tool
 def get_air_quality(city: str) -> str:
+    """
+    查询空气质量。
+    """
+
     return f"{city}：AQI 55（良），PM2.5 18"
+
 
 # ====== 2) 专家 Agents（处理天气与空气质量）======
 weather_agent = Agent(
@@ -43,6 +73,7 @@ weather_agent = Agent(
     model_settings=ModelSettings(tool_choice="auto"),
 )
 
+
 aqi_agent = Agent(
     name="AQI agent",
     instructions=(
@@ -56,6 +87,7 @@ aqi_agent = Agent(
     tools=[get_air_quality],
     model_settings=ModelSettings(tool_choice="auto"),
 )
+
 
 # ====== 3) 改进的分诊 Agent ======
 triage_agent = Agent(
@@ -79,22 +111,33 @@ triage_agent = Agent(
     handoffs=[weather_agent, aqi_agent],
 )
 
-# 设置双向 handoff 关系
+
+# 设置双向 handoff 关系。
+#
+# 这一步非常关键：
+# 如果不把 `triage_agent` 注册回专家 Agent 的 handoffs 中，
+# 那么专家处理完后就无法再把控制权交还给分诊 Agent。
 weather_agent.handoffs = [triage_agent]
 aqi_agent.handoffs = [triage_agent]
 
+
 async def main():
-    # 用户提出的问题，包含天气和空气质量
+    """
+    演示双向 handoff 如何支持复合问题的顺序处理。
+    """
+
     user_question = "武汉天气怎么样？顺便空气质量呢？"
 
-    # 让分诊代理处理问题
     result = Runner.run_streamed(triage_agent, user_question)
 
     print("\n=== STREAM EVENTS ===")
+
     async for event in result.stream_events():
+        # 观察当前活跃 Agent 的变化。
         if event.type == "agent_updated_stream_event":
             print(f"\n👤 agent_updated_stream_event -> {event.new_agent.name}")
 
+        # 观察工具调用、工具输出、消息创建等执行节点。
         if event.type == "run_item_stream_event":
             name = getattr(event, "name", None)
 
@@ -107,12 +150,13 @@ async def main():
 
             elif name == "message_output_created":
                 msg = event.item.raw_item
-                role = getattr(msg, 'role', None)
-                content = getattr(msg, 'content', None)
+                role = getattr(msg, "role", None)
+                content = getattr(msg, "content", None)
                 if content and len(content) > 0:
-                    text_content = content[0].text if hasattr(content[0], 'text') else str(content[0])
+                    text_content = content[0].text if hasattr(content[0], "text") else str(content[0])
                     print(f"\n🧾 message_output_created: role={role}, content={text_content[:50]}...")
 
+        # 打印最终回复的文本增量。
         if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
             print(event.data.delta, end="", flush=True)
 

@@ -182,16 +182,43 @@
   </div>
 
   <script>
+    /*
+      这个前端页面的核心目标是：
+
+      1. 用户输入问题
+      2. 前端调用后端 SSE 接口
+      3. 后端持续推送：
+         - tool_started
+         - tool_completed
+         - text_delta
+         - run_completed
+         - error
+      4. 前端一边接收，一边实时更新聊天界面
+
+      也就是说，这个页面不是一次性 fetch 完整结果，
+      而是通过 EventSource 建立一条“持续接收事件”的连接。
+    */
+
     class ChatClient {
       constructor() {
-        // 你说你要写死
+        // 后端地址。
+        // 这里写死为本地地址，便于演示。
         this.baseUrl = "http://localhost:8200";
+
+        // 可选的会话 ID。
+        // 当前页面预留了这个字段，但后端示例里并没有真正持久化会话。
         this.conversationId = null;
 
+        // 当前 EventSource 连接对象。
         this.eventSource = null;
+
+        // 当前是否处于流式输出中。
         this.isStreaming = false;
 
+        // 指向“当前正在输出中的 assistant 消息 DOM 节点”。
         this.currentAssistantMsgEl = null;
+
+        // 指向“正在输出...”提示节点。
         this.typingEl = null;
 
         this.bindUI();
@@ -199,6 +226,7 @@
       }
 
       bindUI() {
+        // 绑定回车发送。
         const input = document.getElementById("messageInput");
         input.addEventListener("keypress", (e) => {
           if (e.key === "Enter" && !e.shiftKey) {
@@ -210,34 +238,39 @@
 
       // ===== UI helpers =====
       addUserMessage(text) {
+        // 在聊天区追加一条“用户消息”。
         const chatHistory = document.getElementById("chatHistory");
 
         const wrap = document.createElement("div");
         wrap.className = "message user";
+
         const content = document.createElement("div");
         content.className = "message-content";
         content.textContent = text;
-        wrap.appendChild(content);
 
+        wrap.appendChild(content);
         chatHistory.appendChild(wrap);
         this.scrollToBottom();
       }
 
       startAssistantMessage() {
+        // 开始创建一条新的“助手消息”。
+        // 因为后续文本是流式 delta 追加进来的，
+        // 所以需要先准备一个空容器。
         const chatHistory = document.getElementById("chatHistory");
 
-        // 新消息容器
         const wrap = document.createElement("div");
         wrap.className = "message assistant";
+
         const content = document.createElement("div");
         content.className = "message-content";
         content.textContent = "";
-        wrap.appendChild(content);
 
+        wrap.appendChild(content);
         chatHistory.appendChild(wrap);
         this.currentAssistantMsgEl = content;
 
-        // typing indicator
+        // 同时加一个“正在输出...”的打字机提示。
         const typingWrap = document.createElement("div");
         typingWrap.className = "message assistant";
         typingWrap.innerHTML = `
@@ -255,17 +288,26 @@
       }
 
       appendAssistantDelta(delta) {
+        /*
+          把后端发来的文本增量追加到当前助手消息里。
+
+          这就是“打字机效果”的核心：
+          后端每推送一小段文字，前端就把这一小段拼接到当前消息中。
+        */
         if (!this.currentAssistantMsgEl) this.startAssistantMessage();
-        // this.currentAssistantMsgEl.textContent += delta;
-        // 去掉开头连续换行（只在消息刚开始时处理）
-          if (this.currentAssistantMsgEl.textContent.length === 0) {
-            delta = (delta || "").replace(/^\n+/, "");
-          }
-          this.currentAssistantMsgEl.textContent += delta;
+
+        // 当消息刚开始时，去掉开头的多余换行，
+        // 避免部分模型一上来输出多个换行导致界面空一大片。
+        if (this.currentAssistantMsgEl.textContent.length === 0) {
+          delta = (delta || "").replace(/^\n+/, "");
+        }
+
+        this.currentAssistantMsgEl.textContent += delta;
         this.scrollToBottom();
       }
 
       finishAssistantMessage() {
+        // 一条完整消息输出结束后，去掉 typing 指示器。
         if (this.typingEl) {
           this.typingEl.remove();
           this.typingEl = null;
@@ -275,6 +317,7 @@
       }
 
       showToolLine(text, ok = true) {
+        // 在聊天区插入一条“工具调用状态提示”。
         const chatHistory = document.getElementById("chatHistory");
         const div = document.createElement("div");
         div.className = "tool-call";
@@ -284,6 +327,7 @@
       }
 
       showError(text) {
+        // 在聊天区插入错误提示。
         const chatHistory = document.getElementById("chatHistory");
         const div = document.createElement("div");
         div.className = "error-message";
@@ -293,6 +337,7 @@
       }
 
       updateStatus(text, show) {
+        // 更新顶部状态提示条。
         const box = document.getElementById("statusIndicator");
         const t = document.getElementById("statusText");
         t.textContent = text || "";
@@ -301,11 +346,13 @@
       }
 
       setConversationId(id) {
+        // 更新页面上的会话 ID 文本。
         this.conversationId = id;
         document.getElementById("conversationIdValue").textContent = id || "未建立";
       }
 
       setSendingDisabled(disabled) {
+        // 流式过程中通常应禁止重复发送，避免并发冲突。
         document.getElementById("sendButton").disabled = !!disabled;
         document.getElementById("messageInput").disabled = !!disabled;
       }
@@ -317,6 +364,14 @@
 
       // ===== SSE connection =====
       closeStream() {
+        /*
+          关闭当前 EventSource 连接，并恢复 UI。
+
+          这个方法在以下场景会被调用：
+          - 新请求开始前，先关闭旧连接
+          - 流式输出正常结束
+          - 发生错误
+        */
         if (this.eventSource) {
           this.eventSource.close();
           this.eventSource = null;
@@ -327,14 +382,23 @@
       }
 
       openStream(queryText) {
-        // 防止并发：上一次没关就先关
+        /*
+          与后端建立 SSE 长连接。
+
+          这一步会：
+          1. 拼接查询参数
+          2. 创建 EventSource
+          3. 分别监听后端定义的各类事件名
+          4. 根据不同事件更新页面
+        */
+
+        // 防止并发：若上一次连接还没关，先关掉。
         this.closeStream();
 
         const params = new URLSearchParams();
         params.set("query", queryText);
         if (this.conversationId) params.set("conversation_id", this.conversationId);
 
-        // 你要求写死 localhost:8100
         const sseUrl = `${this.baseUrl}/api/chat/sse?${params.toString()}`;
 
         this.eventSource = new EventSource(sseUrl);
@@ -343,7 +407,7 @@
         this.setSendingDisabled(true);
         this.updateStatus("正在处理...", true);
 
-        // ✅ 关键：用 addEventListener 监听你后端发的 event: xxx
+        // 后端如果发送 conversation_started，就可以在这里接收。
         this.eventSource.addEventListener("conversation_started", (e) => {
           try {
             const data = JSON.parse(e.data);
@@ -353,16 +417,17 @@
           }
         });
 
+        // 工具开始执行。
         this.eventSource.addEventListener("tool_started", (e) => {
           try {
             const data = JSON.parse(e.data);
             this.showToolLine(`正在调用工具: ${data.tool_name}`);
-            // this.updateStatus(`正在调用工具: ${data.tool_name}`, true);
           } catch (err) {
             this.showError("tool_started 解析失败");
           }
         });
 
+        // 工具执行完成。
         this.eventSource.addEventListener("tool_completed", (e) => {
           try {
             const data = JSON.parse(e.data);
@@ -372,29 +437,33 @@
           }
         });
 
+        // 文本增量。
+        // 这是实现“助手边想边说”的关键事件。
         this.eventSource.addEventListener("text_delta", (e) => {
           try {
             const data = JSON.parse(e.data);
             this.appendAssistantDelta(data.text || "");
           } catch (err) {
-            // 这里就是你之前一直看到的“无法解析事件数据”的根因
             this.showError("后端返回了无法解析的事件数据（text_delta）");
           }
         });
 
+        // Agent 更新事件。
+        // 在单 Agent 示例里意义有限，但保留下来方便以后扩展多 Agent。
         this.eventSource.addEventListener("agent_updated", (e) => {
           try {
             const data = JSON.parse(e.data);
             this.showToolLine(`👤 Agent切换: ${data.agent_name}`);
           } catch (err) {
-            // 可忽略
+            // 这里不是关键事件，解析失败可以忽略。
           }
         });
 
+        // 整个运行结束。
         this.eventSource.addEventListener("run_completed", (e) => {
-          // run_completed：表示结束
           try {
-            // 你要也可以读 final_output，但我们已经通过 text_delta 拼完了
+            // 这里理论上可以使用 final_output 做额外校验，
+            // 但当前页面已经通过 text_delta 拼出完整回复了。
             JSON.parse(e.data);
           } catch (_) {}
           this.finishAssistantMessage();
@@ -402,46 +471,56 @@
           this.closeStream();
         });
 
+        // SSE 连接层面的错误事件。
         this.eventSource.addEventListener("error", (e) => {
-          // 注意：EventSource 的 error 不保证携带 data
           this.showError("SSE连接错误或中断（可能后端异常/跨域/接口不可达）");
           this.finishAssistantMessage();
           this.closeStream();
         });
 
-        // 兜底：如果后端没指定 event:，会走 message 事件
+        // 兜底处理：
+        // 如果后端没有显式写 `event: xxx`，浏览器会把它当默认 `message` 事件。
         this.eventSource.onmessage = (e) => {
-          // 这里尽量兼容：如果后端用了默认 message + data 里带 type
           try {
             const payload = JSON.parse(e.data);
             if (payload && payload.type === "text_delta" && payload.data?.text) {
               this.appendAssistantDelta(payload.data.text);
             }
           } catch (_) {
-            // 忽略
+            // 忽略非标准兜底格式
           }
         };
       }
 
       // ===== Public action =====
       sendMessage() {
+        /*
+          页面点击“发送”或按下回车时触发。
+
+          执行流程：
+          1. 读取输入框文本
+          2. 把用户消息渲染到页面
+          3. 清空输入框
+          4. 建立 SSE 连接
+          5. 等待后端持续推送事件
+        */
         const input = document.getElementById("messageInput");
         const text = (input.value || "").trim();
         if (!text) return;
 
-        // 展示用户消息
         this.addUserMessage(text);
         input.value = "";
 
-        // 打开 SSE：后端会持续推送 text_delta/tool_started/tool_completed/run_completed
         this.openStream(text);
       }
     }
 
+    // 页面加载完成后，创建一个全局聊天客户端实例。
     document.addEventListener("DOMContentLoaded", () => {
       window.chatClient = new ChatClient();
     });
 
+    // 暴露给按钮 onclick 使用。
     window.sendMessage = function() {
       if (window.chatClient) window.chatClient.sendMessage();
     };
