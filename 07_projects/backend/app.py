@@ -48,10 +48,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+ 
 # 3. 配置模型客户端
 BASE_URL = "https://api.siliconflow.cn/v1"
-API_KEY = "sk-vnxijjgodhcjisacoilnebjzzlqmrwyuluqdxcpwauocgqjm"
+API_KEY = ""
 MODEL_NAME = "Qwen/Qwen3-32B"
 
 
